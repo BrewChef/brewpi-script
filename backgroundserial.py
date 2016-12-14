@@ -72,8 +72,7 @@ class BackGroundSerial():
             sys.exit("Terminating due to fatal serial error")
 
     def __listenThread(self):
-        lastReceive = time.time()
-        while self.run :
+        while self.run:
             in_waiting = None
             new_data = None
             if not self.error:
@@ -81,7 +80,6 @@ class BackGroundSerial():
                     in_waiting = self.ser.inWaiting()
                     if in_waiting > 0:
                         new_data = self.ser.read(in_waiting)
-                        lastReceive = time.time()
                 except (IOError, OSError, SerialException) as e:
                     logMessage('Serial Error: {0})'.format(str(e)))
                     self.error = True
@@ -135,7 +133,6 @@ class BackGroundSerial():
 if __name__ == '__main__':
     # some test code that requests data from serial and processes the response json
     import simplejson
-    import time
     import BrewPiUtil as util
 
     config_file = util.addSlash(sys.path[0]) + 'settings/config.cfg'

@@ -16,7 +16,7 @@ class zeroconfListener(object):
         info = zeroconf_obj.get_service_info(type, name)
         self.brewpi_services[name] = info
         if self.print_on_discover:
-           print("Found '{}' running version '{}' of branch '{}' on a {}".format(info.server[:-1], info.properties['version'], info.properties['branch'], info.properties['board']))
+            print("Found '{}' running version '{}' of branch '{}' on a {}".format(info.server[:-1], info.properties['version'], info.properties['branch'], info.properties['board']))
 
 
 def locate_brewpi_services():
