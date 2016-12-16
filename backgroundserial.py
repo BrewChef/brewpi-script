@@ -51,6 +51,24 @@ class BackGroundSerial():
         except Queue.Empty:
             return None
 
+    # Prevents messages from stacking up in the queue. Alternatively, could build this into brewpi.py
+    def message_was_processed(self):
+        self.exit_on_fatal_error()
+        try:
+            return self.messages.task_done()
+        except Queue.Empty:
+            return None
+
+    def line_was_processed(self):
+        self.exit_on_fatal_error()
+        try:
+            return self.queue.task_done()
+        except Queue.Empty:
+            return None
+
+    def writeln(self, data):
+        self.write(data + "\n")
+
     def write(self, data):
         self.exit_on_fatal_error()
         # prevent writing to a port in error state. This will leave unclosed handles to serial on the system
@@ -86,10 +104,12 @@ class BackGroundSerial():
 
             if new_data:
                 self.buffer = self.buffer + new_data
-                line = self.__get_line_from_buffer()
-                if line:
-                    self.queue.put(line)
-
+                while True:
+                    line = self.__get_line_from_buffer()
+                    if line:
+                        self.queue.put(line)
+                    else:
+                        break
             if self.error:
                 try:
                     # try to restore serial by closing and opening again
@@ -116,7 +136,7 @@ class BackGroundSerial():
                 self.buffer = stripped_buffer
                 continue
             lines = self.buffer.partition('\n') # returns 3-tuple with line, separator, rest
-            if(lines[1] == ''):
+            if not lines[1]:
                 # '\n' not found, first element is incomplete line
                 self.buffer = lines[0]
                 return None
@@ -150,11 +170,11 @@ if __name__ == '__main__':
     for i in range(1, 5):
         # request control variables 4 times. This would overrun buffer if it was not read in a background thread
         # the json decode will then fail, because the message is clipped
-        bg_ser.write('v')
-        bg_ser.write('v')
-        bg_ser.write('v')
-        bg_ser.write('v')
-        bg_ser.write('v')
+        bg_ser.writeln('v')
+        bg_ser.writeln('v')
+        bg_ser.writeln('v')
+        bg_ser.writeln('v')
+        bg_ser.writeln('v')
         line = True
         while(line):
             line = bg_ser.read_line()

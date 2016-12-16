@@ -15,7 +15,8 @@ class TCPSerial(object):
         self.retryCount=0 # count of reconnect attempts performed
         BrewPiUtil.logMessage("Connecting to BrewPi " + host + " on port " + str(port))
         self.open()
-        self.timeout=self.sock.gettimeout()
+        self.setTimeout(0.5)
+        # self.timeout=self.sock.gettimeout()
         self.name=host + ':' + str(port) 
         return      
         
