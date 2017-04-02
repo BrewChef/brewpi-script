@@ -50,12 +50,6 @@ sudo apt-get install -y apache2 libapache2-mod-php5 php5-cli php5-common php5-cg
 
 echo -e "\n***** Installing/updating required python packages via pip... *****\n"
 
-unset CDPATH
-myPath="$( cd "$( dirname "${BASH_SOURCE[0]}")" && pwd )"
-scriptPath="$(dirname "$myPath")"
-
-
-sudo pip install -r "$scriptPath/requirements.txt" --upgrade
-#sudo pip install pyserial psutil simplejson configobj gitpython --upgrade
+sudo pip install pyserial psutil simplejson configobj gitpython --upgrade
 
 echo -e "\n***** Done processing BrewPi dependencies *****\n"

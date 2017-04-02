@@ -1,8 +1,9 @@
 pyserial        # required by brewpi.py
 configobj       # required by brewpi.py
 simplejson      # required by brewpi.py
+pid             # required by brewpi.py
 
-psutil>=2.0     # required by BrewPiProcess.py
+psutil>=2.0     # required by BrewPiProcess.py (Deprecated)
 
 zeroconf        # required by tcpSerial.py
 

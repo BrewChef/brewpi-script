@@ -1,3 +1,8 @@
+# NOTE - This file is no longer used and can likely be deleted. Once refactoring of updateFirmware.py is complete,
+# delete this.
+
+# TODO - Delete this file once refactoring of updateFirmware.py is complete
+
 # Copyright 2013 BrewPi
 # This file is part of BrewPi.
 
@@ -119,7 +124,7 @@ class BrewPiProcesses():
         bpList = []
         matching = []
 
-        # some OS's (OS X) do not allow processes to read info from other processes. 
+        # some OS's (OS X) do not allow processes to read info from other processes.
         try:
             matching = [p for p in psutil.process_iter() if any('python' in p.name() and 'brewpi.py'in s for s in p.cmdline())]
         except psutil.AccessDenied:

@@ -16,7 +16,7 @@
 # along with BrewPi.  If not, see <http://www.gnu.org/licenses/>.
 
 from __future__ import print_function
-import sys
+import os, sys
 
 from BrewPiUtil import printStdErr
 from BrewPiUtil import logMessage
@@ -36,7 +36,6 @@ import shutil
 import traceback
 import urllib
 from distutils.version import LooseVersion
-from serial import SerialException
 
 # load non standard packages, exit when they are not installed
 try:
@@ -48,6 +47,7 @@ try:
                              "If you do not have pip installed, install it with:\n" +
                              "  sudo apt-get install build-essential python-dev python-pip\n")
         sys.exit(1)
+    from serial import SerialException
 except ImportError:
     printStdErr("BrewPi requires PySerial to run, please install it via pip, by running:\n" +
                              "  sudo pip install pyserial --upgrade\n" +
@@ -65,6 +65,11 @@ except ImportError:
     printStdErr("BrewPi requires ConfigObj to run, please install it with 'sudo apt-get install python-configobj")
     sys.exit(1)
 
+try:
+    import pid
+except ImportError:
+    printStdErr("BrewPi requires pid to run, please install it with 'sudo pip install pid --upgrade")
+    sys.exit(1)
 
 #local imports
 import temperatureProfile
@@ -74,14 +79,37 @@ import BrewPiUtil as util
 import brewpiVersion
 import pinList
 import expandLogMessage
-import BrewPiProcess
 from backgroundserial import BackGroundSerial
 
 
+# For Fermentrack compatibility, try to load the Django includes. If we fail, keep running, just set djangoLoaded
+# as false. If it turns out the user tried to launch with dblist/dbcfg, die with an error message.
+try:
+    # Load up the Django specific stuff
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    # This is so Django knows where to find stuff.
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "fermentrack_django.settings")
+    sys.path.append(BASE_DIR)
+
+    # This is so my local_settings.py gets loaded.
+    os.chdir(BASE_DIR)
+
+    from django.core.wsgi import get_wsgi_application
+
+    application = get_wsgi_application()
+    import app.models as models  # This SHOULD work due to the sys.path.append above.
+
+    djangoLoaded = True
+except:
+    djangoLoaded = False
 # Settings will be read from controller, initialize with same defaults as controller
 # This is mainly to show what's expected. Will all be overwritten on the first update from the controller
 
-compatibleHwVersion = "0.4.0"
+legacyHwVersion = "0.2.4"  # Minimum hardware version for 'legacy' branch support
+developHwVersion = "0.4.0"  # Minimum hardware version for 'develop' branch support
+compatibleHwVersion = legacyHwVersion  # Minimum supported version is 'legacy'
+hwMode = ""  # Unused for now - either set to 'legacy' or '0.4.x'
 
 # Control Settings
 cs = dict(mode='b', beerSet=20.0, fridgeSet=20.0)
@@ -95,73 +123,100 @@ cv = "{}"
 # listState = "", "d", "h", "dh" to reflect whether the list is up to date for installed (d) and available (h)
 deviceList = dict(listState="", installed=[], available=[])
 
+keepDeviceListUpdated = False  # Originally, deviceList is only periodically updated. This keeps it updated constantly.
+
 lcdText = ['Script starting up', ' ', ' ', ' ']
 
 # Read in command line arguments
 try:
-    opts, args = getopt.getopt(sys.argv[1:], "hc:sqkfld",
-                               ['help', 'config=', 'status', 'quit', 'kill', 'force', 'log', 'dontrunfile', 'checkstartuponly'])
+    opts, args = getopt.getopt(sys.argv[1:], "hc:sqkfldwL",
+                               ['help', 'config=', 'status', 'quit', 'kill', 'force', 'log', 'dontrunfile', 'checkstartuponly', 'dbcfg=', 'dblist', 'name=', 'pidfiledir='])
 except getopt.GetoptError:
-    printStdErr("Unknown parameter, available Options: --help, --config <path to config file>, " +
-          "--status, --quit, --kill, --force, --log, --dontrunfile")
+    printStdErr("Unknown parameter. Available options: --help, --config <path to config file>, " +
+        "--status, --quit, --kill, --force, --log, --dontrunfile, --dbcfg <Device name in database>, --dblist, " +
+        "--name <name>, --pidfiledir <directory>")
     sys.exit()
 
+# Only one of configFile or dbConfig will be set. If configFile is set, we have a brewpi-www-based installation.
+# If dbConfig is set, we have a Fermentrack based installation.
 configFile = None
+dbConfig = None  # A BrewPiDevice object (which contains all our configuration info)
+
 checkDontRunFile = False
 checkStartupOnly = False
 logToFiles = False
+
+# Defaults
+pidFileDir = "/tmp"
+brewpiName = None  # Defaulting in config file
 
 for o, a in opts:
     # print help message for command line options
     if o in ('-h', '--help'):
         printStdErr("\n Available command line options: ")
         printStdErr("--help: print this help message")
-        printStdErr("--config <path to config file>: specify a config file to use. When omitted settings/config.cf is used")
-        printStdErr("--status: check which scripts are already running")
-        printStdErr("--quit: ask all  instances of BrewPi to quit by sending a message to their socket")
-        printStdErr("--kill: kill all instances of BrewPi by sending SIGKILL")
-        printStdErr("--force: Force quit/kill conflicting instances of BrewPi and keep this one")
+        printStdErr("--config <path to config file>: specify a config file to use. When omitted settings/config.cfg is used. Not compatible with dbcfg.")
         printStdErr("--log: redirect stderr and stdout to log files")
         printStdErr("--dontrunfile: check dontrunfile in www directory and quit if it exists")
         printStdErr("--checkstartuponly: exit after startup checks, return 1 if startup is allowed")
+        printStdErr("--dbcfg <Device name in database>: loads configuration from database")
+        printStdErr("--dblist: lists devices in the database")
+        printStdErr("--pidfiledir <filename>: pid-file path/filename")
+        printStdErr("--name <name>: name of brewpi instance")
         exit()
     # supply a config file
     if o in ('-c', '--config'):
         configFile = os.path.abspath(a)
         if not os.path.exists(configFile):
             sys.exit('ERROR: Config file "%s" was not found!' % configFile)
-    # send quit instruction to all running instances of BrewPi
-    if o in ('-s', '--status'):
-        allProcesses = BrewPiProcess.BrewPiProcesses()
-        allProcesses.update()
-        running = allProcesses.as_dict()
-        if running:
-            pprint(running)
-        else:
-            printStdErr("No BrewPi scripts running")
-        exit()
-    # quit/kill running instances, then keep this one
-    if o in ('-q', '--quit'):
-        logMessage("Asking all BrewPi Processes to quit on their socket")
-        allProcesses = BrewPiProcess.BrewPiProcesses()
-        allProcesses.quitAll()
-        time.sleep(2)
-        exit()
-    # send SIGKILL to all running instances of BrewPi
-    if o in ('-k', '--kill'):
-        logMessage("Killing all BrewPi Processes")
-        allProcesses = BrewPiProcess.BrewPiProcesses()
-        allProcesses.killAll()
-        exit()
-    # close all existing instances of BrewPi by quit/kill and keep this one
-    if o in ('-f', '--force'):
-        logMessage("Closing all existing processes of BrewPi and keeping this one")
-        allProcesses = BrewPiProcess.BrewPiProcesses()
-        if len(allProcesses.update()) > 1:  # if I am not the only one running
-            allProcesses.quitAll()
-            time.sleep(2)
-            if len(allProcesses.update()) > 1:
-                printStdErr("Asking the other processes to quit nicely did not work. Killing them with force!")
+        if dbConfig is not None:
+            sys.exit('ERROR: Cannot use both --config and --dbcfg! Pick one and try again!')
+
+    if o in ('--pidfiledir'):
+        if not os.path.exists(a):
+            sys.exit('ERROR: pidfiledir "%s" does not exist' % a)
+        pidFileDir = a
+
+    if o in ('--name'):
+        if dbConfig is not None:
+            sys.exit("ERROR: Cannot use both --name and --dbcfg! Pick one and try again!")
+        brewpiName = a
+
+    # list all devices in the database
+    if o in ('-L', '--dblist'):
+        if not djangoLoaded:
+            sys.exit('ERROR: dblist specified, but django headers were not successfully loaded! This option only works with Fermentrack')
+
+        try:
+            dbDevices = models.BrewPiDevice.objects.all()
+            print("=============== BrewPi Devices in Database ===============")
+            if len(dbDevices) == 0:
+                print("No configured devices found.")
+            else:
+                x = 0
+                for d in dbDevices:
+                    x += 1
+                    print("Devices:")
+                    print("  %d: %s" % (x, d.device_name))
+            print("===========================================================")
+            exit()
+        except Exception, e:
+            sys.exit(e)
+
+    # load the configuration from the database
+    if o in ('-w', '--dbcfg'):
+        if not djangoLoaded:
+            sys.exit('ERROR: dbcfg specified, but django headers were not successfully loaded! This option only works with Fermentrack')
+        # Try loading the database configuration from Django
+        try:
+            dbConfig = models.BrewPiDevice.objects.get(device_name=a)
+            brewpiName = a
+            keepDeviceListUpdated = True  # For dbConfig based installs, pull the device list synchronously
+        except:
+            sys.exit('ERROR: No database configuration with the name \'{}\' was found!'.format(a))
+        if configFile is not None:
+            sys.exit('ERROR: Cannot use both --config and --dbcfg! Pick one and try again!')
+
     # redirect output of stderr and stdout to files in log directory
     if o in ('-l', '--log'):
         logToFiles = True
@@ -171,27 +226,47 @@ for o, a in opts:
     if o in ('--checkstartuponly'):
         checkStartupOnly = True
 
-if not configFile:
+
+# Alright. We're modifying how we load the configuration file to allow for loading both from a database, and from the
+# actual file-based config.
+
+# If neither configFile or dbConfig were set, assume we need to load defaults
+if configFile is None and dbConfig is None:
     configFile = util.addSlash(sys.path[0]) + 'settings/config.cfg'
 
-config = util.readCfgWithDefaults(configFile)
+if configFile is not None:  # If we had a file-based config (or are defaulting) then load the config file
+    config = util.read_config_file_with_defaults(configFile)
 
-dontRunFilePath = os.path.join(config['wwwPath'], 'do_not_run_brewpi')
-# check dont run file when it exists and exit it it does
-if checkDontRunFile:
-    if os.path.exists(dontRunFilePath):
-        # do not print anything, this will flood the logs
+    # check dont run file when it exists and exit it it does
+    # For dbConfig-based installs we use dbConfig.status instead of the dontRunFile
+    if checkDontRunFile:
+        dontRunFilePath = os.path.join(config['wwwPath'], 'do_not_run_brewpi')
+        if os.path.exists(dontRunFilePath):
+            # do not print anything, this will flood the logs
+            exit(0)
+    if brewpiName is None:
+        brewpiName = config['brewpiName']  # Update brewpiName if in the config file and not explicitly set on cmd line
+        if brewpiName is None:
+            raise ValueError
+elif dbConfig is not None:  # Load from the database
+    if dbConfig.status == models.BrewPiDevice.STATUS_ACTIVE or dbConfig.status == models.BrewPiDevice.STATUS_UNMANAGED:
+        config = util.read_config_from_database_without_defaults(dbConfig)
+    else:
+        logMessage("This instance of BrewPi is currently disabled in the web interface. Reenable it and relaunch " \
+                   "this script. This instance will now exit.")
         exit(0)
+else:  # This should never be hit - Just adding it to the code to make it clear that if neither of these work, we exit
+    exit(1)
 
 # check for other running instances of BrewPi that will cause conflicts with this instance
-allProcesses = BrewPiProcess.BrewPiProcesses()
-allProcesses.update()
-myProcess = allProcesses.me()
-if allProcesses.findConflicts(myProcess):
-    if not checkDontRunFile:
-        logMessage("Another instance of BrewPi is already running, which will conflict with this instance. " +
+pidFile = pid.PidFile(piddir=pidFileDir, pidname=brewpiName)
+try:
+    pidFile.create()
+except pid.PidFileAlreadyLockedError:
+    if not checkDontRunFile:  # Even for database configurations, we don't want to log this if the gatekeeper launched me
+        logMessage("Another instance of BrewPi is already running, which will conflict with this instance. " \
                    "This instance will exit")
-    exit(0)
+        exit(0)
 
 if checkStartupOnly:
     exit(1)
@@ -213,23 +288,26 @@ if logToFiles:
 # userSettings.json is a copy of some of the settings that are needed by the web server.
 # This allows the web server to load properly, even when the script is not running.
 def changeWwwSetting(settingName, value):
-    wwwSettingsFileName = util.addSlash(config['wwwPath']) + 'userSettings.json'
-    if os.path.exists(wwwSettingsFileName):
-        wwwSettingsFile = open(wwwSettingsFileName, 'r+b')
-        try:
-            wwwSettings = json.load(wwwSettingsFile)  # read existing settings
-        except json.JSONDecodeError:
-            logMessage("Error in decoding userSettings.json, creating new empty json file")
-            wwwSettings = {}  # start with a fresh file when the json is corrupt.
-    else:
-        wwwSettingsFile = open(wwwSettingsFileName, 'w+b')  # create new file
-        wwwSettings = {}
+    # We only update changeWwwSetting if we're using a configFile based installation (That is - brewpi-www)
+    if configFile is not None:
+        wwwSettingsFileName = util.addSlash(config['wwwPath']) + 'userSettings.json'
+        if os.path.exists(wwwSettingsFileName):
+            wwwSettingsFile = open(wwwSettingsFileName, 'r+b')
+            try:
+                wwwSettings = json.load(wwwSettingsFile)  # read existing settings
+            except json.JSONDecodeError:
+                logMessage("Error in decoding userSettings.json, creating new empty json file")
+                wwwSettings = {}  # start with a fresh file when the json is corrupt.
+        else:
+            wwwSettingsFile = open(wwwSettingsFileName, 'w+b')  # create new file
+            wwwSettings = {}
 
-    wwwSettings[settingName] = str(value)
-    wwwSettingsFile.seek(0)
-    wwwSettingsFile.write(json.dumps(wwwSettings))
-    wwwSettingsFile.truncate()
-    wwwSettingsFile.close()
+        wwwSettings[settingName] = str(value)
+        wwwSettingsFile.seek(0)
+        wwwSettingsFile.write(json.dumps(wwwSettings))
+        wwwSettingsFile.truncate()
+        wwwSettingsFile.close()
+
 
 def setFiles():
     global config
@@ -240,56 +318,61 @@ def setFiles():
     global lastDay
     global day
 
-    # create directory for the data if it does not exist
-    beerFileName = config['beerName']
-    dataPath = util.addSlash(util.addSlash(util.scriptPath()) + 'data/' + beerFileName)
-    wwwDataPath = util.addSlash(util.addSlash(config['wwwPath']) + 'data/' + beerFileName)
+    if configFile is not None:  # We only track the files in brewpi.py for configFile (brewpi-www) installations
 
-    if not os.path.exists(dataPath):
-        os.makedirs(dataPath)
-        os.chmod(dataPath, 0775)  # give group all permissions
-    if not os.path.exists(wwwDataPath):
-        os.makedirs(wwwDataPath)
-        os.chmod(wwwDataPath, 0775)  # give group all permissions
+        # create directory for the data if it does not exist
+        beerFileName = config['beerName']
+        dataPath = util.addSlash(util.addSlash(util.scriptPath()) + 'data/' + beerFileName)
+        wwwDataPath = util.addSlash(util.addSlash(config['wwwPath']) + 'data/' + beerFileName)
 
-    # Keep track of day and make new data file for each day
-    day = time.strftime("%Y-%m-%d")
-    lastDay = day
-    # define a JSON file to store the data
-    jsonFileName = beerFileName + '-' + day
+        if not os.path.exists(dataPath):
+            os.makedirs(dataPath)
+            os.chmod(dataPath, 0775)  # give group all permissions
+        if not os.path.exists(wwwDataPath):
+            os.makedirs(wwwDataPath)
+            os.chmod(wwwDataPath, 0775)  # give group all permissions
 
-    #if a file for today already existed, add suffix
-    if os.path.isfile(dataPath + jsonFileName + '.json'):
-        i = 1
-        while os.path.isfile(dataPath + jsonFileName + '-' + str(i) + '.json'):
-            i += 1
-        jsonFileName = jsonFileName + '-' + str(i)
+        # Keep track of day and make new data file for each day
+        day = time.strftime("%Y-%m-%d")
+        lastDay = day
+        # define a JSON file to store the data
+        jsonFileName = beerFileName + '-' + day
 
-    localJsonFileName = dataPath + jsonFileName + '.json'
-    brewpiJson.newEmptyFile(localJsonFileName)
+        #if a file for today already existed, add suffix
+        if os.path.isfile(dataPath + jsonFileName + '.json'):
+            i = 1
+            while os.path.isfile(dataPath + jsonFileName + '-' + str(i) + '.json'):
+                i += 1
+            jsonFileName = jsonFileName + '-' + str(i)
 
-    # Define a location on the web server to copy the file to after it is written
-    wwwJsonFileName = wwwDataPath + jsonFileName + '.json'
+        localJsonFileName = dataPath + jsonFileName + '.json'
+        brewpiJson.newEmptyFile(localJsonFileName)
 
-    # Define a CSV file to store the data as CSV (might be useful one day)
-    localCsvFileName = (dataPath + beerFileName + '.csv')
-    wwwCsvFileName = (wwwDataPath + beerFileName + '.csv')
+        # Define a location on the web server to copy the file to after it is written
+        wwwJsonFileName = wwwDataPath + jsonFileName + '.json'
 
-    # create new empty json file
-    brewpiJson.newEmptyFile(localJsonFileName)
+        # Define a CSV file to store the data as CSV (might be useful one day)
+        localCsvFileName = (dataPath + beerFileName + '.csv')
+        wwwCsvFileName = (wwwDataPath + beerFileName + '.csv')
+
+        # create new empty json file
+        brewpiJson.newEmptyFile(localJsonFileName)
+
 
 def startBeer(beerName):
-    if config['dataLogging'] == 'active':
-        setFiles()
+    # For dbConfig-based installations, beer creation & linking has been moved to BrewPiUtil.py
+    if configFile is not None:  # If we're using a configFile-based (brewpi-www) installation, set everything up
+        if config['dataLogging'] == 'active':
+            setFiles()
 
-    changeWwwSetting('beerName', beerName)
+        changeWwwSetting('beerName', beerName)
 
 
 def startNewBrew(newName):
     global config
     if len(newName) > 1:     # shorter names are probably invalid
-        config = util.configSet(configFile, 'beerName', newName)
-        config = util.configSet(configFile, 'dataLogging', 'active')
+        config = util.configSet(configFile, dbConfig, 'beerName', newName)
+        config = util.configSet(configFile, dbConfig, 'dataLogging', 'active')
         startBeer(newName)
         logMessage("Notification: Restarted logging for beer '%s'." % newName)
         return {'status': 0, 'statusMessage': "Successfully switched to new brew '%s'. " % urllib.unquote(newName) +
@@ -303,8 +386,8 @@ def stopLogging():
     global config
     logMessage("Stopped data logging, as requested in web interface. " +
                "BrewPi will continue to control temperatures, but will not log any data.")
-    config = util.configSet(configFile, 'beerName', None)
-    config = util.configSet(configFile, 'dataLogging', 'stopped')
+    config = util.configSet(configFile, dbConfig, 'beerName', None)
+    config = util.configSet(configFile, dbConfig, 'dataLogging', 'stopped')
     changeWwwSetting('beerName', None)
     return {'status': 0, 'statusMessage': "Successfully stopped logging"}
 
@@ -314,7 +397,7 @@ def pauseLogging():
     logMessage("Paused logging data, as requested in web interface. " +
                "BrewPi will continue to control temperatures, but will not log any data until resumed.")
     if config['dataLogging'] == 'active':
-        config = util.configSet(configFile, 'dataLogging', 'paused')
+        config = util.configSet(configFile, dbConfig, 'dataLogging', 'paused')
         return {'status': 0, 'statusMessage': "Successfully paused logging."}
     else:
         return {'status': 1, 'statusMessage': "Logging already paused or stopped."}
@@ -324,10 +407,15 @@ def resumeLogging():
     global config
     logMessage("Continued logging data, as requested in web interface.")
     if config['dataLogging'] == 'paused':
-        config = util.configSet(configFile, 'dataLogging', 'active')
+        config = util.configSet(configFile, dbConfig, 'dataLogging', 'active')
         return {'status': 0, 'statusMessage': "Successfully continued logging."}
-    else:
-        return {'status': 1, 'statusMessage': "Logging was not paused."}
+    elif config['dataLogging'] == 'stopped':
+        if dbConfig is not None:
+            if dbConfig.active_beer is not None:
+                config = util.configSet(configFile, dbConfig, 'dataLogging', 'active')
+                return {'status': 0, 'statusMessage': "Successfully continued logging."}
+    # If we didn't return a success status above, we'll return an error
+    return {'status': 1, 'statusMessage': "Logging was not resumed."}
 
 # bytes are read from nonblocking serial into this buffer and processed when the buffer contains a full line.
 ser = util.setupSerial(config, time_out=0)
@@ -349,21 +437,37 @@ if hwVersion is None:
     # script will continue so you can at least program the controller
     lcdText = ['Could not receive', 'version from controller', 'Please (re)program', 'your controller']
 else:
-    logMessage("Found " + hwVersion.toExtendedString() + \
-               " on port " + ser.name + "\n")
-    if LooseVersion( hwVersion.toString() ) < LooseVersion(compatibleHwVersion):
+    logMessage("Found " + hwVersion.toExtendedString() + " on port " + ser.name + "\n")
+    if LooseVersion(hwVersion.toString()) < LooseVersion(compatibleHwVersion):
+        # Completely incompatible. Unlikely to ever be triggered, as it requires pre-legacy code.
         logMessage("Warning: minimum BrewPi version compatible with this script is " +
-                   compatibleHwVersion +
-                   " but version number received is " + hwVersion.toString())
+                   compatibleHwVersion + " but version number received is " + hwVersion.toString() + ". Exiting.")
+        exit(1)
+    elif LooseVersion(hwVersion.toString()) < LooseVersion(legacyHwVersion):
+        # Compatible, but only with pre-legacy (!) code. This should never happen as legacy support is the "oldest"
+        # codebase we provide for.
+        # This will generally never happen given that we are setting compatible = legacy above
+        logMessage("Warning: minimum BrewPi version compatible with this script for legacy support is " +
+                   legacyHwVersion + " but version number received is " + hwVersion.toString() + ". Exiting.")
+        exit(1)
+    elif LooseVersion(hwVersion.toString()) < LooseVersion(developHwVersion):
+        # Version is between Legacy and 'develop' (v0.4.x) which means it receives 'legacy' support.
+        # This MAY create issues with v0.3.x controllers - but I lack one to test.
+        logMessage("BrewPi version received was {} which this script supports in ".format(hwVersion.toString()) +
+                   "'legacy' branch mode.")
+        hwMode = "legacy"
+    else:
+        logMessage("BrewPi version received was {} which this script supports in ".format(hwVersion.toString()) +
+                   "'develop' branch mode.")
+        hwMode = "0.4.x"
+
+
     if int(hwVersion.log) != int(expandLogMessage.getVersion()):
         logMessage("Warning: version number of local copy of logMessages.h " +
                    "does not match log version number received from controller." +
                    "controller version = " + str(hwVersion.log) +
-                   ", local copy version = " + str(expandLogMessage.getVersion()))
-    if hwVersion.family == 'Arduino':
-        exit("\n ERROR: the newest version of BrewPi is not compatible with Arduino. \n" +
-            "You can use our legacy branch with your Arduino, in which we only include the backwards compatible changes. \n" +
-            "To change to the legacy branch, run: sudo ~/brewpi-tools/updater.py --ask , and choose the legacy branch.")
+                   ", local copy version = " + str(expandLogMessage.getVersion()) +
+                   ". This is generally a non-issue, as thus far log messages have only been added - not changed.")
 
 
 bg_ser = None
@@ -378,6 +482,10 @@ if ser is not None:
     bg_ser.writeln('s')  # request control settings cs
     bg_ser.writeln('c')  # request control constants cc
     bg_ser.writeln('v')  # request control variables cv
+    if keepDeviceListUpdated:
+        bg_ser.writeln("d{r:1}")        # request installed devices
+        bg_ser.writeln("h{u:-1,v:1}")   # request available, but not installed devices
+
     # answer from controller is received asynchronously later.
 
 # create a listening socket to communicate with PHP
@@ -387,10 +495,11 @@ if useInetSocket:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     socketPort = config.get('socketPort', 6332)
-    s.bind((config.get('socketHost', 'localhost'), int(socketPort)))
-    logMessage('Bound to TCP socket on port %d ' % int(socketPort))
+    socketHost = config.get('socketHost', 'localhost')
+    s.bind((socketHost, int(socketPort)))
+    logMessage('Bound to TCP socket on port {}, interface {} '.format(int(socketPort), socketHost))
 else:
-    socketFile = util.addSlash(util.scriptPath()) + 'BEERSOCKET'
+    socketFile = util.addSlash(util.scriptPath()) + config.get('socket_name', 'BEERSOCKET')  # Making this configurable
     if os.path.exists(socketFile):
     # if socket already exists, remove it
         os.remove(socketFile)
@@ -440,8 +549,22 @@ def renameTempKey(key):
         "t": "Time"}
     return rename.get(key, key)
 
+# At startup, if we're using a db-based config, force synchronization of temperature format
+def syncTempFormat(control_constants):
+    if dbConfig is not None:
+        db_temp_format = dbConfig.temp_format
+
+        if cc['tempFormat'] != db_temp_format:
+            # j{"tempFormat": "C"}
+            settings_dict = {'tempFormat': dbConfig.temp_format}
+            bg_ser.writeln("j" + json.dumps(settings_dict))
+            # TODO - Set min/max temp if necessary
+
+
 while run:
-    if config['dataLogging'] == 'active':
+
+    # We only need to do the day roll if we're saving to flatfiles
+    if configFile is not None and config['dataLogging'] == 'active':
         # Check whether it is a new day
         lastDay = day
         day = time.strftime("%Y-%m-%d")
@@ -510,6 +633,8 @@ while run:
             # round to 2 dec, python will otherwise produce 6.999999999
             cs['beerSet'] = round(newTemp, 2)
             bg_ser.writeln("j{mode:b, beerSet:" + json.dumps(cs['beerSet']) + "}")
+            if dbConfig is not None:
+                models.BrewPiDevice.objects.get(device_name=a) # Reload dbConfig from the database (in case we were using profiles)
             logMessage("Notification: Beer temperature set to " +
                        str(cs['beerSet']) +
                        " degrees in web interface")
@@ -525,6 +650,8 @@ while run:
             cs['mode'] = 'f'
             cs['fridgeSet'] = round(newTemp, 2)
             bg_ser.writeln("j{mode:f, fridgeSet:" + json.dumps(cs['fridgeSet']) + "}")
+            if dbConfig is not None:
+                models.BrewPiDevice.objects.get(device_name=a) # Reload dbConfig from the database (in case we were using profiles)
             logMessage("Notification: Fridge temperature set to " +
                        str(cs['fridgeSet']) +
                        " degrees in web interface")
@@ -533,6 +660,8 @@ while run:
         elif messageType == "setOff":  # cs['mode'] set to OFF
             cs['mode'] = 'o'
             bg_ser.writeln("j{mode:o}")
+            if dbConfig is not None:
+                models.BrewPiDevice.objects.get(device_name=a) # Reload dbConfig from the database (in case we were using profiles)
             logMessage("Notification: Temperature control disabled")
             raise socket.timeout
         elif messageType == "setParameters":
@@ -542,18 +671,28 @@ while run:
                 bg_ser.writeln("j" + json.dumps(decoded))
                 if 'tempFormat' in decoded:
                     changeWwwSetting('tempFormat', decoded['tempFormat'])  # change in web interface settings too.
+                    if decoded['tempFormat'] <> config.get('temp_format', 'C') and dbConfig is not None:
+                        # For database configured installs, we save this in the device definition
+                        util.configSet(configFile, dbConfig, 'temp_format', decoded['tempFormat'])
+                    if dbConfig is not None:
+                        dbConfig = models.BrewPiDevice.objects.get(id=dbConfig.id)  # Reload dbConfig from the database
             except json.JSONDecodeError:
                 logMessage("Error: invalid JSON parameter string received: " + value)
             raise socket.timeout
         elif messageType == "stopScript":  # exit instruction received. Stop script.
             # voluntary shutdown.
-            # write a file to prevent the cron job from restarting the script
-            logMessage("stopScript message received on socket. " +
-                       "Stopping script and writing dontrunfile to prevent automatic restart")
+            log_message = "stopScript message received on socket. "
             run = 0
-            dontrunfile = open(dontRunFilePath, "w")
-            dontrunfile.write("1")
-            dontrunfile.close()
+            if configFile is not None:  # If we're using configFile (brewpi-www) then write to dontRunFile
+                # write a file to prevent the cron job from restarting the script
+                dontrunfile = open(dontRunFilePath, "w")
+                dontrunfile.write("1")
+                dontrunfile.close()
+                log_message += "Stopping script and writing dontrunfile to prevent automatic restart"
+            else:
+                log_message += "dbConfig in use - assuming device status was already properly updated "
+                log_message += "to prevent automatic restart"
+            logMessage(log_message)
             continue
         elif messageType == "quit":  # quit instruction received. Probably sent by another brewpi script instance
             logMessage("quit message received on socket. Stopping script.")
@@ -562,21 +701,21 @@ while run:
             # This instruction is meant to restart the script or replace it with another instance.
             continue
         elif messageType == "eraseLogs":
-            # erase the log files for stderr and stdout
-            open(util.scriptPath() + '/logs/stderr.txt', 'wb').close()
-            open(util.scriptPath() + '/logs/stdout.txt', 'wb').close()
-            logMessage("Fresh start! Log files erased.")
+            if logToFiles:  # TODO - Determine if logToFiles is actually used, or we should just use std configFile test
+                # erase the log files for stderr and stdout
+                open(util.scriptPath() + '/logs/stderr.txt', 'wb').close()
+                open(util.scriptPath() + '/logs/stdout.txt', 'wb').close()
+                logMessage("Fresh start! Log files erased.")
             continue
         elif messageType == "interval":  # new interval received
             newInterval = int(value)
             if 5 < newInterval < 5000:
                 try:
-                    config = util.configSet(configFile, 'interval', float(newInterval))
+                    config = util.configSet(configFile, dbConfig, 'interval', float(newInterval))
                 except ValueError:
                     logMessage("Cannot convert interval '" + value + "' to float")
                     continue
-                logMessage("Notification: Interval changed to " +
-                           str(newInterval) + " seconds")
+                logMessage("Notification: Interval changed to " + str(newInterval) + " seconds")
         elif messageType == "startNewBrew":  # new beer name
             newName = value
             result = startNewBrew(newName)
@@ -591,40 +730,56 @@ while run:
             result = resumeLogging()
             conn.send(json.dumps(result))
         elif messageType == "dateTimeFormatDisplay":
-            config = util.configSet(configFile, 'dateTimeFormatDisplay', value)
-            changeWwwSetting('dateTimeFormatDisplay', value)
-            logMessage("Changing date format config setting: " + value)
+            if configFile is not None:
+                config = util.configSet(configFile, dbConfig, 'dateTimeFormatDisplay', value)
+                changeWwwSetting('dateTimeFormatDisplay', value)
+                logMessage("Changing date format config setting: " + value)
         elif messageType == "setActiveProfile":
-            # copy the profile CSV file to the working directory
-            logMessage("Setting profile '%s' as active profile" % value)
-            config = util.configSet(configFile, 'profileName', value)
-            changeWwwSetting('profileName', value)
-            profileSrcFile = util.addSlash(config['wwwPath']) + "data/profiles/" + value + ".csv"
-            profileDestFile = util.addSlash(util.scriptPath()) + 'settings/tempProfile.csv'
-            profileDestFileOld = profileDestFile + '.old'
-            try:
-                if os.path.isfile(profileDestFile):
-                    if os.path.isfile(profileDestFileOld):
-                        os.remove(profileDestFileOld)
-                    os.rename(profileDestFile, profileDestFileOld)
-                shutil.copy(profileSrcFile, profileDestFile)
-                # for now, store profile name in header row (in an additional column)
-                with file(profileDestFile, 'r') as original:
-                    line1 = original.readline().rstrip("\n")
-                    rest = original.read()
-                with file(profileDestFile, 'w') as modified:
-                    modified.write(line1 + "," + value + "\n" + rest)
-            except IOError as e:  # catch all exceptions and report back an error
-                error = "I/O Error(%d) updating profile: %s " % (e.errno, e.strerror)
-                conn.send(error)
-                printStdErr(error)
-            else:
+            if configFile is not None:
+                # We're using a configFile object (and therefore are relying on CSV files to manage profiles)
+                # copy the profile CSV file to the working directory
+                logMessage("Setting profile '%s' as active profile" % value)
+                config = util.configSet(configFile, dbConfig, 'profileName', value)
+                changeWwwSetting('profileName', value)
+                profileSrcFile = util.addSlash(config['wwwPath']) + "data/profiles/" + value + ".csv"
+                profileDestFile = util.addSlash(util.scriptPath()) + 'settings/tempProfile.csv'
+                profileDestFileOld = profileDestFile + '.old'
+                try:
+                    if os.path.isfile(profileDestFile):
+                        if os.path.isfile(profileDestFileOld):
+                            os.remove(profileDestFileOld)
+                        os.rename(profileDestFile, profileDestFileOld)
+                    shutil.copy(profileSrcFile, profileDestFile)
+                    # for now, store profile name in header row (in an additional column)
+                    with file(profileDestFile, 'r') as original:
+                        line1 = original.readline().rstrip("\n")
+                        rest = original.read()
+                    with file(profileDestFile, 'w') as modified:
+                        modified.write(line1 + "," + value + "\n" + rest)
+                except IOError as e:  # catch all exceptions and report back an error
+                    error = "I/O Error(%d) updating profile: %s " % (e.errno, e.strerror)
+                    conn.send(error)
+                    printStdErr(error)
+                else:
+                    conn.send("Profile successfully updated")
+                    if cs['mode'] is not 'p':
+                        cs['mode'] = 'p'
+                        bg_ser.writeln("j{mode:p}")
+                        logMessage("Notification: Profile mode enabled")
+                        raise socket.timeout  # go to serial communication to update controller
+
+            elif dbConfig is not None:
+                # We're using a dbConfig object to manage everything. We aren't being passed anything by Fermentrack
+                logMessage("Setting controller to beer profile mode using database-configured profile")
                 conn.send("Profile successfully updated")
+                if dbConfig is not None:
+                    dbConfig = models.BrewPiDevice.objects.get(id=dbConfig.id)  # Reload dbConfig from the database
                 if cs['mode'] is not 'p':
                     cs['mode'] = 'p'
                     bg_ser.writeln("j{mode:p}")
                     logMessage("Notification: Profile mode enabled")
                     raise socket.timeout  # go to serial communication to update controller
+
         elif messageType == "programController" or messageType == "programArduino":
             if bg_ser is not None:
                 bg_ser.stop()
@@ -650,13 +805,19 @@ while run:
             python = sys.executable
             os.execl(python, python, *sys.argv)
         elif messageType == "refreshDeviceList":
-            deviceList['listState'] = ""  # invalidate local copy
+            if keepDeviceListUpdated is False:
+                # Don't invalidate the device list if we're always keeping it updated
+                # TODO - Determine if this is a smart move
+                deviceList['listState'] = ""  # invalidate local copy
             if value.find("readValues") != -1:
                 bg_ser.writeln("d{r:1}")  # request installed devices
                 bg_ser.writeln("h{u:-1,v:1}")  # request available, but not installed devices
             else:
                 bg_ser.writeln("d{}")  # request installed devices
                 bg_ser.writeln("h{u:-1}")  # request available, but not installed devices
+            if keepDeviceListUpdated:
+                time.sleep(5)  # We'll give the controller 5 seconds to respond
+                raise socket.timeout
         elif messageType == "getDeviceList":
             if deviceList['listState'] in ["dh", "hd"]:
                 response = dict(board=hwVersion.board,
@@ -665,22 +826,57 @@ while run:
                                 pinList=pinList.getPinList(hwVersion.board, hwVersion.shield))
                 conn.send(json.dumps(response))
             else:
+                if keepDeviceListUpdated:
+                    time.sleep(5)  # We'll give the controller 5 seconds to respond, even though we won't see it this cycle
                 conn.send("device-list-not-up-to-date")
+                raise socket.timeout
+        elif messageType == "getDashInfo":
+            # This is a new messageType
+            response = {"BeerTemp": prevTempJson['BeerTemp'],
+                        "FridgeTemp": prevTempJson['FridgeTemp'],
+                        "BeerAnn": prevTempJson['BeerAnn'],
+                        "FridgeAnn": prevTempJson['FridgeAnn'],
+                        "RoomTemp": prevTempJson['RoomTemp'],
+                        "State": prevTempJson['State'],
+                        "BeerSet": prevTempJson['BeerSet'],
+                        "FridgeSet": prevTempJson['FridgeSet'],
+                        "LogInterval": config['interval'],
+                        "Mode": cs['mode']}
+            conn.send(json.dumps(response))
         elif messageType == "applyDevice":
+            # applyDevice is used to apply settings to an existing device (pin/OneWire assignment, etc.)
             try:
                 configStringJson = json.loads(value)  # load as JSON to check syntax
             except json.JSONDecodeError:
                 logMessage("Error: invalid JSON parameter string received: " + value)
                 continue
             bg_ser.writeln("U" + json.dumps(configStringJson))
-            deviceList['listState'] = ""  # invalidate local copy
+
+            if keepDeviceListUpdated:  # If we have this set, immediately request a refresh of the device list
+                # TODO - Determine if it is a smart move to not invalidate listState first
+                bg_ser.writeln("d{r:1}")  # request installed devices
+                bg_ser.writeln("h{u:-1,v:1}")  # request available, but not installed devices
+                time.sleep(5)  # We'll give the controller 5 seconds to respond
+                raise socket.timeout
+            else:
+                # If we don't have keepDeviceListUpdated set, invalidate the cache (to be updated later)
+                deviceList['listState'] = ""  # invalidate local copy
         elif messageType == "writeDevice":
+            # writeDevice is used to -create- "acutators" -- Specifically, (for now) buttons.
             try:
                 configStringJson = json.loads(value)  # load as JSON to check syntax
             except json.JSONDecodeError:
                 logMessage("Error: invalid JSON parameter string received: " + value)
                 continue
             bg_ser.writeln("d" + json.dumps(configStringJson))
+
+            deviceList['listState'] = ""  # invalidate local copy
+
+            if keepDeviceListUpdated:  # If we have this set, immediately request a refresh of the device list
+                bg_ser.writeln("d{r:1}")  # request installed devices
+                bg_ser.writeln("h{u:-1,v:1}")  # request available, but not installed devices
+                time.sleep(5)  # We'll give the controller 5 seconds to respond
+                raise socket.timeout
         elif messageType == "getVersion":
             if hwVersion:
                 response = hwVersion.__dict__
@@ -693,6 +889,16 @@ while run:
         elif messageType == "resetController":
             logMessage("Resetting controller to factory defaults")
             bg_ser.writeln("E")
+            # request settings from controller, processed later when reply is received
+            bg_ser.writeln('s')  # request control settings cs
+            bg_ser.writeln('c')  # request control constants cc
+            bg_ser.writeln('v')  # request control variables cv
+            if keepDeviceListUpdated:
+                bg_ser.writeln("d{r:1}")  # request installed devices
+                bg_ser.writeln("h{u:-1,v:1}")  # request available, but not installed devices
+            time.sleep(5)  # We'll give the controller 5 seconds to respond
+            raise socket.timeout
+
         else:
             logMessage("Error: Received invalid message on socket: " + message)
 
@@ -755,29 +961,40 @@ while run:
                             prevTempJson[renameTempKey(key)] = newData[key]
 
                         newRow = prevTempJson
-                        # add to JSON file
-                        brewpiJson.addRow(localJsonFileName, newRow)
-                        # copy to www dir.
-                        # Do not write directly to www dir to prevent blocking www file.
-                        shutil.copyfile(localJsonFileName, wwwJsonFileName)
-                        #write csv file too
-                        csvFile = open(localCsvFileName, "a")
-                        try:
-                            lineToWrite = (time.strftime("%b %d %Y %H:%M:%S;") +
-                                           json.dumps(newRow['BeerTemp']) + ';' +
-                                           json.dumps(newRow['BeerSet']) + ';' +
-                                           json.dumps(newRow['BeerAnn']) + ';' +
-                                           json.dumps(newRow['FridgeTemp']) + ';' +
-                                           json.dumps(newRow['FridgeSet']) + ';' +
-                                           json.dumps(newRow['FridgeAnn']) + ';' +
-                                           json.dumps(newRow['State']) + ';' +
-                                           json.dumps(newRow['RoomTemp']) + '\n')
-                            csvFile.write(lineToWrite)
-                        except KeyError, e:
-                            logMessage("KeyError in line from controller: %s" % str(e))
 
-                        csvFile.close()
-                        shutil.copyfile(localCsvFileName, wwwCsvFileName)
+                        # For configFile-based installations (brewpi-www) create the old-style CSV/JSON dump
+                        if configFile is not None:
+                            # add to JSON file
+                            brewpiJson.addRow(localJsonFileName, newRow)
+                            #write csv file too
+                            csvFile = open(localCsvFileName, "a")
+                            try:
+                                lineToWrite = (time.strftime("%b %d %Y %H:%M:%S;") +
+                                               json.dumps(newRow['BeerTemp']) + ';' +
+                                               json.dumps(newRow['BeerSet']) + ';' +
+                                               json.dumps(newRow['BeerAnn']) + ';' +
+                                               json.dumps(newRow['FridgeTemp']) + ';' +
+                                               json.dumps(newRow['FridgeSet']) + ';' +
+                                               json.dumps(newRow['FridgeAnn']) + ';' +
+                                               json.dumps(newRow['State']) + ';' +
+                                               json.dumps(newRow['RoomTemp']) + '\n')
+                                csvFile.write(lineToWrite)
+                            except KeyError, e:
+                                logMessage("KeyError in line from controller: %s" % str(e))
+
+                            csvFile.close()
+
+                            # copy to www dir.
+                            # Do not write directly to www dir to prevent blocking www file.
+                            shutil.copyfile(localJsonFileName, wwwJsonFileName)
+                            shutil.copyfile(localCsvFileName, wwwCsvFileName)
+
+                        elif dbConfig is not None:  # If this is a django-based install, use the model to save
+                            util.save_beer_log_point(dbConfig, newRow)
+                        else:
+                            # Shouldn't ever get here - dbConfig AND configFile aren't set
+                            raise NotImplementedError
+
                     elif line[0] == 'D':
                         # debug message received, should already been filtered out, but print anyway here.
                         logMessage("Finding a log message here should not be possible, report to the devs!")
@@ -789,6 +1006,7 @@ while run:
                     elif line[0] == 'C':
                         # Control constants received
                         cc = json.loads(line[2:])
+                        syncTempFormat(control_constants=cc)  # Check the temp format just in case
                     elif line[0] == 'S':
                         # Control settings received
                         prevSettingsUpdate = time.time()
@@ -828,8 +1046,17 @@ while run:
 
         # Check for update from temperature profile
         if cs['mode'] == 'p':
-            newTemp = temperatureProfile.getNewTemp(util.scriptPath())
-            if newTemp != cs['beerSet']:
+            if dbConfig is not None:
+                newTemp = dbConfig.get_profile_temp()  # Use the Django model
+            else:
+                newTemp = temperatureProfile.getNewTemp(util.scriptPath())  # Use the legacy code
+
+            if newTemp is None:  # If we had an error loading a temperature (from dbConfig) disable temp control
+                cs['mode'] = 'o'
+                bg_ser.writeln("j{mode:o}")
+                logMessage("Notification: Error in profile mode - turning off temp control")
+                # raise socket.timeout  # go to serial communication to update controller
+            elif newTemp != cs['beerSet']:
                 cs['beerSet'] = newTemp
                 # if temperature has to be updated send settings to controller
                 bg_ser.writeln("j{beerSet:" + json.dumps(cs['beerSet']) + "}")

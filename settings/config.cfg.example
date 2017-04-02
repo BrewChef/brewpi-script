@@ -3,10 +3,17 @@
 
 # scriptPath = /home/brewpi/
 # wwwPath = /var/www/
-# port = /dev/ttyACM0
-# altport = /dev/ttyACM1
 # boardType = leonardo
 # startupDelay = 1.0
+
+# For serial-based installations, uncomment (at least) 'port' below and set to the correct serial device
+# port = /dev/ttyACM0
+# altport = /dev/ttyACM1
+
+# For WiFi (ESP8266)-based installations, uncomment wifiHost and wifiPort below and set to the appropriate values
+# wifiHost = esp8266.local
+# wifiPort = 23
+
 # debug = true
 
 

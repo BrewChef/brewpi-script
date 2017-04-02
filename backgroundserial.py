@@ -155,8 +155,10 @@ if __name__ == '__main__':
     import simplejson
     import BrewPiUtil as util
 
+
+    # TODO - Rewrite the test code below to work with the database
     config_file = util.addSlash(sys.path[0]) + 'settings/config.cfg'
-    config = util.readCfgWithDefaults(config_file)
+    config = util.read_config_file_with_defaults(config_file)
     ser = util.setupSerial(config, time_out=0)
     if not ser:
         printStdErr("Could not open Serial Port")

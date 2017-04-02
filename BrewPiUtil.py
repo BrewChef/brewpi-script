@@ -23,6 +23,11 @@ import autoSerial
 import tcpSerial
 
 try:
+    import app.models as models  # This is only applicable if we're working with Django-based models
+except:
+    pass
+
+try:
     import configobj
 except ImportError:
     print("BrewPi requires ConfigObj to run, please install it with 'sudo apt-get install python-configobj")
@@ -40,13 +45,12 @@ def addSlash(path):
     return path
 
 
-def readCfgWithDefaults(cfg):
+def read_config_file_with_defaults(cfg):
     """
     Reads a config file with the default config file as fallback
 
     Params:
     cfg: string, path to cfg file
-    defaultCfg: string, path to defaultConfig file.
 
     Returns:
     ConfigObj of settings
@@ -68,18 +72,111 @@ def readCfgWithDefaults(cfg):
     return config
 
 
-def configSet(configFile, settingName, value):
-    if not os.path.isfile(configFile):
-        logMessage("User config file %s does not exist yet, creating it..." % configFile)
-    try:
-        config = configobj.ConfigObj(configFile)
-        config[settingName] = value
-        config.write()
-    except IOError as e:
-        logMessage("I/O error(%d) while updating %s: %s " % (e.errno, configFile, e.strerror))
-        logMessage("Probably your permissions are not set correctly. " +
-                   "To fix this, run 'sudo sh /home/brewpi/fixPermissions.sh'")
-    return readCfgWithDefaults(configFile)  # return updated ConfigObj
+def read_config_from_database_without_defaults(db_config_object):
+    """
+    Reads configuration parameters from the database without
+
+    Params:
+    db_config_object: models.BrewPiDevice, BrewPiDevice object
+
+    Returns:
+    ConfigObj of settings
+    """
+
+    config = {}
+
+    # Unlike the above, we don't have defaults (because we assume the database enforces defaults). Load everything.
+    # config['scriptPath'] = db_config_object.script_path
+    config['port'] = db_config_object.serial_port
+    # if db_config_object.serial_alt_port <> 'None':
+    config['altport'] = db_config_object.serial_alt_port
+    config['boardType'] = db_config_object.board_type
+    config['beerName'] = db_config_object.get_active_beer_name()
+    config['interval'] = float(db_config_object.data_point_log_interval)  # Converting to a float to match config file
+    config['dataLogging'] = db_config_object.logging_status
+    config['socket_name'] = db_config_object.socket_name
+    config['connection_type'] = db_config_object.connection_type
+    config['wifiHost'] = db_config_object.wifi_host
+    config['wifiPort'] = db_config_object.wifi_port
+    config['useInetSocket'] = db_config_object.useInetSocket
+    config['socketPort'] = db_config_object.socketPort
+    config['socketHost'] = db_config_object.socketHost
+
+    return config
+
+
+def configSet(configFile, db_config_object, settingName, value):
+    if configFile:
+        if not os.path.isfile(configFile):
+            logMessage("User config file %s does not exist yet, creating it..." % configFile)
+        try:
+            config = configobj.ConfigObj(configFile)
+            config[settingName] = value
+            config.write()
+        except IOError as e:
+            logMessage("I/O error(%d) while updating %s: %s " % (e.errno, configFile, e.strerror))
+            logMessage("Probably your permissions are not set correctly. " +
+                       "To fix this, run 'sudo sh /home/brewpi/fixPermissions.sh'")
+        return read_config_file_with_defaults(configFile)  # return updated ConfigObj
+    else:
+        # Assuming we have a valid db_config_object here
+        if settingName == "port":
+            db_config_object.serial_port = value
+        elif settingName == "altport":
+            db_config_object.serial_alt_port = value
+        elif settingName == "boardType":
+            db_config_object.board_type = value
+        elif settingName == "beerName":
+            # If we have a blank or NoneType name, we're unsetting the beer.
+            if value is None or len(value) < 1:
+                db_config_object.active_beer = None
+            else:  # Otherwise, we need to (possibly) create the beer and link it to the chamber
+                # One thing to note - In traditional brewpi-www the beer is entirely created within/managed by the
+                # brewpi-script. For Fermentrack we're
+                new_beer, created = models.Beer.objects.get_or_create(name=value, device=db_config_object)
+                if created:
+                    # If we just created the beer, set the temp format (otherwise, defaults to Fahrenheit)
+                    new_beer.format = db_config_object.temp_format
+                    new_beer.save()
+                if db_config_object.active_beer != new_beer:
+                    db_config_object.active_beer = new_beer
+
+        elif settingName == "socket_name":
+            db_config_object.socket_name = value
+        elif settingName == "interval":
+            db_config_object.data_point_log_interval = value
+        elif settingName == "dataLogging":
+            db_config_object.logging_status = value
+        else:
+            # In all other cases, just try to set the field directly
+            setattr(db_config_object, settingName, value)
+        db_config_object.save()
+        return read_config_from_database_without_defaults(db_config_object)
+
+def save_beer_log_point(db_config_object, beer_row):
+    """
+    Saves a row of data to the database (mapping the data row we are passed to Django's BeerLogPoint model)
+    :param db_config_object:
+    :param beer_row:
+    :return:
+    """
+    new_log_point = models.BeerLogPoint()
+
+    new_log_point.beer_temp = beer_row['BeerTemp']
+    new_log_point.beer_set = beer_row['BeerSet']
+    new_log_point.beer_ann = beer_row['BeerAnn']
+
+    new_log_point.fridge_temp = beer_row['FridgeTemp']
+    new_log_point.fridge_set = beer_row['FridgeSet']
+    new_log_point.fridge_ann = beer_row['FridgeAnn']
+
+    new_log_point.room_temp = beer_row['RoomTemp']
+    new_log_point.state = beer_row['State']
+
+    new_log_point.temp_format = db_config_object.temp_format
+    new_log_point.associated_beer = db_config_object.active_beer
+
+    new_log_point.save()
 
 def printStdErr(*objs):
     print("", *objs, file=sys.stderr)
@@ -119,49 +216,59 @@ def setupSerial(config, baud_rate=57600, time_out=0.1):
     error2 = None
     # open serial port
     tries = 0
-    logMessage("Opening serial port")
-    while tries < 10:
-        error = ""
-        for portSetting in [config['port'], config['altport']]:
-            if portSetting == None or portSetting == 'None' or portSetting == "none":
-                continue  # skip None setting
-            if portSetting == "auto":
-                port = findSerialPort(bootLoader=False)
-                if not port:
-                    error = "Could not find compatible serial devices \n"
-                    continue # continue with altport
-            else:
-                port = portSetting
-            try:
-                ser = serial.Serial(port, baudrate=baud_rate, timeout=time_out, write_timeout=0)
-                if ser:
-                    break
-            except (IOError, OSError, serial.SerialException) as e:
-                # error += '0}.\n({1})'.format(portSetting, str(e))
-                error += str(e) + '\n'
-        if ser:
-            break
-        tries += 1
-        time.sleep(1)
-
-    if not(ser):
-        tries=0
-        logMessage("No serial attached BrewPi found.  Trying TCP serial (WiFi)")
+    connection_type = config.get('connection_type', 'auto')
+    if connection_type == "serial" or connection_type == "auto":
+        logMessage("Opening serial port")
         while tries < 10:
             error = ""
- 
-            if config['wifiHost'] == 'auto':
-                pass
-                # mdns=tcpSerial.MDNSBrowser()
-                # (tcpHost, tcpPort)=mdns.discoverBrewpis()
-                # ser = tcpSerial.TCPSerial(tcpHost,tcpPort)
-            else:
-                if not(config['wifiHost'] == None or config['wifiPort'] == None or config['wifiHost'] == 'None' or config['wifiPort'] == 'None' or config['wifiHost'] == 'none' or config['wifiPort'] == 'none'):
-                    ser = tcpSerial.TCPSerial(config['wifiHost'],int(config['wifiPort']))                    
+            for portSetting in [config['port'], config['altport']]:
+                if portSetting == None or portSetting == 'None' or portSetting == "none":
+                    continue  # skip None setting
+                if portSetting == "auto":
+                    port = findSerialPort(bootLoader=False)
+                    if not port:
+                        error = "Could not find compatible serial devices \n"
+                        continue # continue with altport
+                else:
+                    port = portSetting
+                try:
+                    ser = serial.Serial(port, baudrate=baud_rate, timeout=time_out, write_timeout=0)
+                    if ser:
+                        break
+                except (IOError, OSError, serial.SerialException) as e:
+                    # error += '0}.\n({1})'.format(portSetting, str(e))
+                    error += str(e) + '\n'
             if ser:
                 break
             tries += 1
             time.sleep(1)
+
+    if connection_type == "wifi" or connection_type == "auto":
+        if not(ser):
+            tries=0
+            if connection_type == "auto":
+                logMessage("No serial attached BrewPi found.  Trying TCP serial (WiFi)")
+            else:
+                logMessage("Connection type WiFi selected.  Trying TCP serial (WiFi)")
+            while tries < 10:
+                error = ""
+
+                if not(config['wifiHost'] == None or config['wifiPort'] == None or config['wifiHost'] == 'None' or config['wifiPort'] == 'None' or config['wifiHost'] == 'none' or config['wifiPort'] == 'none'):
+                    ser = tcpSerial.TCPSerial(config['wifiHost'],int(config['wifiPort']))
+                else:
+                    logMessage("Invalid WiFi configuration:")
+                    logMessage("  wifiHost: {}".format(config['wifiHost']))
+                    logMessage("  wifiPort: {}".format(config['wifiPort']))
+                    logMessage("Exiting.")
+                    exit(1)
+
+                if ser:
+                    break
+                tries += 1
+                time.sleep(1)
+        if not(ser):  # At this point, we've tried both serial & WiFi. Need to die.
+            logMessage("Unable to connect via WiFi. Exiting.")
+            exit(1)
 
 
     if ser:
