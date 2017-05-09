@@ -256,7 +256,7 @@ elif dbConfig is not None:  # Load from the database
                    "this script. This instance will now exit.")
         exit(0)
 else:  # This should never be hit - Just adding it to the code to make it clear that if neither of these work, we exit
-    exit(1)
+    exit(0)
 
 # check for other running instances of BrewPi that will cause conflicts with this instance
 pidFile = pid.PidFile(piddir=pidFileDir, pidname=brewpiName)
@@ -266,7 +266,7 @@ except pid.PidFileAlreadyLockedError:
     if not checkDontRunFile:  # Even for database configurations, we don't want to log this if the gatekeeper launched me
         logMessage("Another instance of BrewPi is already running, which will conflict with this instance. " \
                    "This instance will exit")
-        exit(0)
+    exit(0)
 
 if checkStartupOnly:
     exit(1)
@@ -436,6 +436,7 @@ if hwVersion is None:
                "Please upload a new version of BrewPi to your controller.")
     # script will continue so you can at least program the controller
     lcdText = ['Could not receive', 'version from controller', 'Please (re)program', 'your controller']
+    exit(1)
 else:
     logMessage("Found " + hwVersion.toExtendedString() + " on port " + ser.name + "\n")
     if LooseVersion(hwVersion.toString()) < LooseVersion(compatibleHwVersion):
@@ -517,6 +518,7 @@ s.settimeout(serialCheckInterval)
 
 
 prevDataTime = 0.0  # keep track of time between new data requests
+prevTimeOutReq = prevDataTime  # Using this to fix the prevDataTime tracking
 prevTimeOut = time.time()
 prevLcdUpdate = time.time()
 prevSettingsUpdate = time.time()
@@ -928,10 +930,13 @@ while run:
 
         # if no new data has been received for serialRequestInteval seconds
         if (time.time() - prevDataTime) >= float(config['interval']):
-            bg_ser.writeln("t")  # request new from controller
-            prevDataTime += 5 # give the controller some time to respond to prevent requesting twice
+            if (time.time() - prevTimeOutReq) > 5:  # If it's been more than 5 seconds since we last requested temps
+                bg_ser.writeln("t")  # request new from controller
+                prevTimeOutReq = time.time()
+                if prevDataTime == 0.0:  # If prevDataTime hasn't yet been set (it's 0.0 at script startup), set it.
+                    prevDataTime = time.time()
 
-        elif (time.time() - prevDataTime) > float(config['interval']) + 2 * float(config['interval']):
+        if (time.time() - prevDataTime) >= 3 * float(config['interval']):
             #something is wrong: controller is not responding to data requests
             logMessage("Error: controller is not responding to new data requests. Exiting.")
 

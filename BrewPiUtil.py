@@ -23,6 +23,18 @@ import autoSerial
 import tcpSerial
 
 try:
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    # This is so Django knows where to find stuff.
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "fermentrack_django.settings")
+    sys.path.append(BASE_DIR)
+
+    # This is so my local_settings.py gets loaded.
+    os.chdir(BASE_DIR)
+
+    from django.core.wsgi import get_wsgi_application
+
+    application = get_wsgi_application()
     import app.models as models  # This is only applicable if we're working with Django-based models
 except:
     pass
@@ -31,7 +43,7 @@ try:
     import configobj
 except ImportError:
     print("BrewPi requires ConfigObj to run, please install it with 'sudo apt-get install python-configobj")
-    sys.exit(1)
+    sys.exit(0)
 
 
 def addSlash(path):
@@ -74,7 +86,7 @@ def read_config_file_with_defaults(cfg):
 
 def read_config_from_database_without_defaults(db_config_object):
     """
-    Reads configuration parameters from the database without
+    Reads configuration parameters from the database without defaults
 
     Params:
     db_config_object: models.BrewPiDevice, BrewPiDevice object
@@ -101,6 +113,13 @@ def read_config_from_database_without_defaults(db_config_object):
     config['useInetSocket'] = db_config_object.useInetSocket
     config['socketPort'] = db_config_object.socketPort
     config['socketHost'] = db_config_object.socketHost
+    config['wifiIPAddress'] = db_config_object.get_cached_ip()  # If we have a cached IP from mDNS, we'll use it
+
+    udevPort = db_config_object.get_port_from_udev()
+    if udevPort is None:
+        logMessage("Unable to locate device using USB serial number")
+    else:
+        config['udevPort'] = udevPort  # If we prioritize udev lookup for serial, get the port
 
     return config
 
@@ -118,7 +137,7 @@ def configSet(configFile, db_config_object, settingName, value):
             logMessage("Probably your permissions are not set correctly. " +
                        "To fix this, run 'sudo sh /home/brewpi/fixPermissions.sh'")
         return read_config_file_with_defaults(configFile)  # return updated ConfigObj
-    else:
+    elif db_config_object:
         # Assuming we have a valid db_config_object here
         if settingName == "port":
             db_config_object.serial_port = value
@@ -152,6 +171,10 @@ def configSet(configFile, db_config_object, settingName, value):
             setattr(db_config_object, settingName, value)
         db_config_object.save()
         return read_config_from_database_without_defaults(db_config_object)
+    else:
+        # This is a pretty major error - we really should
+        logMessage("Neither the config file nor dbcfg were valid. This shouldn't be possible - exiting.")
+        sys.exit(0)
 
 def save_beer_log_point(db_config_object, beer_row):
     """
@@ -218,10 +241,26 @@ def setupSerial(config, baud_rate=57600, time_out=0.1):
     tries = 0
     connection_type = config.get('connection_type', 'auto')
     if connection_type == "serial" or connection_type == "auto":
-        logMessage("Opening serial port")
+        if connection_type == "auto":
+            logMessage("Connection type set to 'auto' - Attempting serial first")
+        else:
+            logMessage("Connection type Serial selected. Opening serial port.")
         while tries < 10:
             error = ""
-            for portSetting in [config['port'], config['altport']]:
+            ports_to_try = []
+
+            # If we have a udevPort (from a dbconfig object, found via the udev serial number) use that as the first
+            # option - replacing config['port'].
+            if 'udevPort' in config:
+                ports_to_try.append(config['udevPort'])
+            else:
+                ports_to_try.append(config.get('port', "auto"))
+
+            # Regardless of if we have 'udevPort', add altport as well
+            if 'altport' in config:
+                ports_to_try.append(config['altport'])
+
+            for portSetting in ports_to_try:
                 if portSetting == None or portSetting == 'None' or portSetting == "none":
                     continue  # skip None setting
                 if portSetting == "auto":
@@ -234,6 +273,7 @@ def setupSerial(config, baud_rate=57600, time_out=0.1):
                 try:
                     ser = serial.Serial(port, baudrate=baud_rate, timeout=time_out, write_timeout=0)
                     if ser:
+                        logMessage("Connected via serial to port {}".format(port))
                         break
                 except (IOError, OSError, serial.SerialException) as e:
                     # error += '0}.\n({1})'.format(portSetting, str(e))
@@ -254,13 +294,16 @@ def setupSerial(config, baud_rate=57600, time_out=0.1):
                 error = ""
 
                 if not(config['wifiHost'] == None or config['wifiPort'] == None or config['wifiHost'] == 'None' or config['wifiPort'] == 'None' or config['wifiHost'] == 'none' or config['wifiPort'] == 'none'):
-                    ser = tcpSerial.TCPSerial(config['wifiHost'],int(config['wifiPort']))
+                    # We're going to use the wifiIPAddress
+                    connect_to = config.get('wifiIPAddress', config['wifiHost'])
+                    port = int(config['wifiPort'])
+                    ser = tcpSerial.TCPSerial(host=connect_to, port=port, hostname=config['wifiHost'])
                 else:
                     logMessage("Invalid WiFi configuration:")
                     logMessage("  wifiHost: {}".format(config['wifiHost']))
                     logMessage("  wifiPort: {}".format(config['wifiPort']))
                     logMessage("Exiting.")
-                    exit(1)
+                    exit(0)
 
                 if ser:
                     break
@@ -268,7 +311,7 @@ def setupSerial(config, baud_rate=57600, time_out=0.1):
                 time.sleep(1)
         if not(ser):  # At this point, we've tried both serial & WiFi. Need to die.
             logMessage("Unable to connect via WiFi. Exiting.")
-            exit(1)
+            exit(0)
 
 
     if ser:
@@ -276,7 +319,8 @@ def setupSerial(config, baud_rate=57600, time_out=0.1):
         ser.flushInput()
         ser.flushOutput()
     else:
-         logMessage("Errors while opening serial port: \n" + error)
+        logMessage("Errors while opening serial port: \n" + error)
+        sys.exit(0)  # Die if we weren't able to connect
 
     # yes this is monkey patching, but I don't see how to replace the methods on a dynamically instantiated type any other way
     if dumpSerial:
